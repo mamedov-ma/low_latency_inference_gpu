@@ -79,3 +79,10 @@ if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set_property(TARGET bench_warp_persistent_mlp PROPERTY CUDA_ARCHITECTURES ${_DEFAULT_ARCHS})
 endif()
 
+add_executable(bench_cublas_persistent_mlp src/bench_persistent_cublas_mlp.cu)
+target_include_directories(bench_cublas_persistent_mlp PRIVATE include)
+target_link_libraries(bench_cublas_persistent_mlp PRIVATE cublas)
+if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set_property(TARGET bench_cublas_persistent_mlp PROPERTY CUDA_ARCHITECTURES ${_DEFAULT_ARCHS})
+endif()
+
