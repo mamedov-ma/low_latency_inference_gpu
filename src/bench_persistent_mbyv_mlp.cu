@@ -1,3 +1,4 @@
+// src/bench_persistent_mbyv_mlp.cu
 #include <cuda_runtime.h>
 
 #include <atomic>
@@ -31,13 +32,12 @@ static inline void cpu_pause()
 static inline void host_sfence()
 {
 #if defined(__x86_64__) || defined(_M_X64)
-    // Flush write-combining buffers / order writes for CPU->GPU doorbell on WC memory.
+    // Flush write-combining buffers / order WC writes (important for CPU->GPU doorbell).
     __asm__ __volatile__("sfence" ::: "memory");
 #else
     std::atomic_thread_fence(std::memory_order_seq_cst);
 #endif
 }
-
 
 static void host_init(std::vector<float> &v, float scale, uint32_t seed)
 {
@@ -95,25 +95,23 @@ struct alignas(64) TickBuffer {
 };
 
 // -------------------------
-// Device helpers
+// Device helpers for mapped host polling
+// IMPORTANT: use .cv loads for sysmem to avoid L2 "sticking".
 // -------------------------
-__device__ __forceinline__ uint32_t ld_nc_u32(const volatile uint32_t *p)
+__device__ __forceinline__ uint32_t ld_cv_u32(const volatile uint32_t *p)
 {
     uint32_t v;
-    asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(v) : "l"(p));
+    asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(v) : "l"(p));
     return v;
 }
-__device__ __forceinline__ float ld_nc_f32(const float *p)
+__device__ __forceinline__ float ld_cv_f32(const float *p)
 {
     float v;
-    asm volatile("ld.global.nc.f32 %0, [%1];" : "=f"(v) : "l"(p));
+    asm volatile("ld.global.cv.f32 %0, [%1];" : "=f"(v) : "l"(p));
     return v;
 }
-__device__ __forceinline__ void st_wt_u32(volatile uint32_t *p, uint32_t v)
-{
-    asm volatile("st.global.wt.u32 [%0], %1;" :: "l"(p), "r"(v));
-}
 
+// device mem reads/writes (use atomics to avoid compiler caching)
 __device__ __forceinline__ uint32_t ld_u32(const uint32_t *p)
 {
     return (uint32_t)atomicAdd((unsigned int *)p, 0u);
@@ -122,6 +120,13 @@ __device__ __forceinline__ void st_u32(uint32_t *p, uint32_t v)
 {
     atomicExch((unsigned int *)p, (unsigned int)v);
 }
+
+// host-visible store (works for sysmem when paired with __threadfence_system)
+__device__ __forceinline__ void st_wt_u32(volatile uint32_t *p, uint32_t v)
+{
+    asm volatile("st.global.wt.u32 [%0], %1;" :: "l"(p), "r"(v));
+}
+
 __device__ __forceinline__ void relax()
 {
 #if __CUDA_ARCH__ >= 700
@@ -178,7 +183,7 @@ __global__ void persistent_mbyv_mlp_kernel(
 
     __shared__ float l1_shmem[L1_SHM_N * L1_WARPS * 32];
 
-    // block0-only shared tick latch (avoids warp-only shfl broadcast)
+    // block0-only shared tick latch
     __shared__ volatile uint32_t sh_stage_s;
 
     if (bid == 0) {
@@ -225,11 +230,11 @@ __global__ void persistent_mbyv_mlp_kernel(
             // leader polls and latches tick into shared
             if (lane == 0 && warp == 0) {
                 for (;;) {
-                    if (ld_nc_u32(&tb->stop)) {
+                    if (ld_cv_u32(&tb->stop)) {
                         sh_stage_s = STOP_SEQ;
                         break;
                     }
-                    uint32_t s_in = ld_nc_u32(&tb->seq_in);
+                    uint32_t s_in = ld_cv_u32(&tb->seq_in);
                     if (s_in != 0 && s_in != last_tick) {
                         // reset only counters per tick
                         st_u32(l1_cnt, 0);
@@ -258,11 +263,11 @@ __global__ void persistent_mbyv_mlp_kernel(
                 return;
             }
 
-            // stage input using all block0 threads
+            // stage input using all block0 threads (use .cv reads from sysmem)
             int tid    = warp * 32 + lane;
             int stride = (int)(blockDim.x * blockDim.y); // 256
             for (int i = tid; i < (int)IN_DIM; i += stride)
-                d_x[i] = ld_nc_f32(&tb->x[i]);
+                d_x[i] = ld_cv_f32(&tb->x[i]);
 
             __syncthreads();
             __threadfence();
@@ -314,7 +319,6 @@ __global__ void persistent_mbyv_mlp_kernel(
         // L2: only blocks 0..1 run
         // -------------------------
         if (bid < L2_BLOCKS) {
-            // monotonic wait (prevents lost-wakeup)
             while (ld_u32(l1_done_seq) < s) {
                 if (ld_u32(work_seq) == STOP_SEQ) return;
                 relax();
@@ -450,7 +454,6 @@ int main()
     CUDA_CHECK(cudaMemcpy(d_b3, h_b3.data(),   h_b3.size()   * sizeof(float), cudaMemcpyHostToDevice));
 
     // TickBuffer pinned+mapped
-    // IMPORTANT: WriteCombined helps CPU->GPU doorbells (seq_in) be visible promptly.
     TickBuffer *h_tb=nullptr;
     CUDA_CHECK(cudaHostAlloc((void **)&h_tb, sizeof(TickBuffer),
                              cudaHostAllocMapped | cudaHostAllocWriteCombined));
@@ -499,7 +502,7 @@ int main()
     uint32_t seq = 1;
     std::atomic_thread_fence(std::memory_order_release);
     h_tb->seq_in = seq;
-    host_sfence(); // flush WC writes
+    host_sfence();
 
     while (*seq_out_p != seq) {
         cpu_pause();
@@ -519,7 +522,7 @@ int main()
 
     // Warmup
     for (int i = 0; i < warmup; i++) {
-        std::cout << "warmup iter: " << i << "\n";
+        // std::cout << "warmup iter: " << i << "\n";
         std::atomic_thread_fence(std::memory_order_release);
         h_tb->seq_in = ++seq;
         host_sfence();
