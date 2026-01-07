@@ -67,3 +67,15 @@ if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set_property(TARGET bench_mbyv_packed_graph PROPERTY CUDA_ARCHITECTURES ${_DEFAULT_ARCHS})
 endif()
 
+add_executable(bench_mbyv_persistent src/bench_persistent_mbyv_mlp.cu)
+target_include_directories(bench_mbyv_persistent PRIVATE include)
+if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set_property(TARGET bench_mbyv_persistent PROPERTY CUDA_ARCHITECTURES ${_DEFAULT_ARCHS})
+endif()
+
+add_executable(bench_warp_persistent_mlp src/bench_persistent_mlp.cu)
+target_include_directories(bench_warp_persistent_mlp PRIVATE include)
+if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set_property(TARGET bench_warp_persistent_mlp PROPERTY CUDA_ARCHITECTURES ${_DEFAULT_ARCHS})
+endif()
+
